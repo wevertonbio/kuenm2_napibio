@@ -640,3 +640,130 @@ reorder_stats_columns <- function(stats_final, omission_rate){
   last_cols <- setdiff(colnames(stats_final), c(first_cols, metric_cols))
   orders_cols <- c(first_cols, ordered_metric_cols, last_cols)
   return(stats_final[,orders_cols])}
+
+#### PROC ####
+proc <- function(x, formula_grid, data, omission_rate = 10,
+                 addsamplestobackground = TRUE, weights = NULL,
+                 model_type){
+
+  #Check arguments
+  if(!inherits(formula_grid, "data.frame")){
+    stop("Argument formula_grid must be a data.frame, not ", class(formula_grid))
+  }
+
+  if(!inherits(omission_rate, "numeric")){
+    stop("Argument omission_rate must be numeric, not ", class(omission_rate))
+  }
+
+  if(!inherits(addsamplestobackground, "logical")){
+    stop("Argument addsamplestobackground must be logical, not ", class(addsamplestobackground))
+  }
+
+  if(!is.null(weights)){
+    if(!inherits(weights, "numeric")){
+      stop("Argument weights must be NULL or numeric, not ", class(weights))
+    }}
+
+  if(!inherits(model_type, "character")){
+    stop("Argument model_type must be a character, not ", class(model_type))
+  }
+
+  if(!(model_type %in% c("glm", "glmnet"))){
+    stop("Argument model_type must be 'glm' or 'glmnet'")
+  }
+  ####
+
+  grid_x <- formula_grid[x,] # Get i candidate model
+  #Get formula and reg
+  formula_x <- as.formula(grid_x$Formulas)
+  reg_x <- grid_x$regm
+
+  if(model_type == "glm"){
+    formula_x <- as.formula(paste("pr_bg ", grid_x$Formulas))
+  }
+
+  # Get background index
+  bgind <- which(data$calibration_data$pr_bg == 0)
+
+  # Fit models using k-fold cross-validation
+  mods <- try(lapply(1:length(data$kfolds), function(i) {
+    notrain <- -data$kfolds[[i]]
+    data_i <- data$calibration_data[notrain,]
+
+    # Set weights per k-fold
+    if (!is.null(weights)){
+      weights_i <- weights[notrain]
+    } else {
+      weights_i <- NULL
+    }
+
+    if (model_type == "glmnet") {
+      # Run glmnet model
+      mod_i <- glmnet_mx(p = data_i$pr_bg, data = data_i,
+                         f = formula_x, regmult = reg_x,
+                         addsamplestobackground = addsamplestobackground,
+                         weights = weights_i, calculate_AIC = FALSE)
+    } else {
+      # Run glm model
+      mod_i <- glm_mx(formula = formula_x,
+                      family = binomial(link = "cloglog"),
+                      data = data_i, weights = weights_i)
+    }
+
+    # Predict model
+    pred_i <- if (model_type == "glmnet") {
+      as.numeric(predict.glmnet_mx(object = mod_i,
+                                   newdata = data$calibration_data,
+                                   clamp = FALSE, type = "cloglog"))
+    } else if (model_type == "glm") {
+      enmpa::predict_glm(model = mod_i,
+                         newdata = data$calibration_data,
+                         type = "response")
+    }
+
+    # Extract suitability in train and test points
+    suit_val_cal <- pred_i[unique(c(notrain, -bgind))]
+    suit_val_eval <- pred_i[which(!-notrain %in% bgind)]
+
+    #Proc
+    proc_i <- lapply(omission_rate, function(omr){
+      proc_omr <- enmpa::proc_enm(test_prediction = suit_val_eval,
+                                  prediction = pred_i,
+                                  threshold = omr)$pROC_summary
+      names(proc_omr) <- c(paste0("Mean_AUC_ratio_at_", omr),
+                           paste0("pval_pROC_at_", omr))
+      return(proc_omr)
+    })
+    proc_i <- unlist(proc_i)
+
+    # Save metrics in a dataframe
+    df_proc <-  if (model_type == "glmnet") {
+      data.frame(Replicate = i,
+                 t(proc_i),
+                 row.names = NULL)
+    } else if (model_type == "glm") {
+      data.frame(Replicate = i,
+                 t(proc_i),
+                 row.names = NULL)
+    }
+    return(df_proc)
+  }), silent = TRUE)
+  #Get summary
+  proc_df <- do.call("rbind", mods)
+
+  #Get means and sd
+  means <- sapply(proc_df[, -1], mean)  # Excluindo a coluna Replicate
+  sds <- sapply(proc_df[, -1], sd)
+
+  #Create new dataframe
+  proc_df <- data.frame(
+    t(c(means, sds))
+  )
+  #Rename
+  names(proc_df) <- c(paste0(names(means), ".mean"), paste0(names(sds), ".sd"))
+
+  #Append model ID
+  proc_df$ID <- grid_x$ID
+
+  return(proc_df)
+}

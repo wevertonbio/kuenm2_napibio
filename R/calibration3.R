@@ -513,15 +513,19 @@ calibration3 <- function(data,
   bm <- sel_best_models3(data = data,
                          cand_models = res_final$Summary,
                          test_concave = test_concave,
+                         calc_proc = TRUE,
                          omrat_threshold = omrat_threshold,
                          allow_tolerance = allow_tolerance,
                          tolerance = tolerance,
-                         AIC = AIC,
+                         AIC_option = AIC,
                          significance = 0.05, verbose = verbose,
                          delta_aic = delta_aic,
                          addsamplestobackground = addsamplestobackground,
                          weights = weights,
-                         model_type = model_type)
+                         model_type = model_type,
+                         parallel = parallel, ncores = ncores,
+                         parallel_type = parallel_type,
+                         progress_bar = progress_bar)
 
   # Concatenate final results
   fm <- c(data, calibration_results = list(res_final),

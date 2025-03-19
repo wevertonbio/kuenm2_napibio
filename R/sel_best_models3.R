@@ -80,265 +80,276 @@
 #' calib_results_glm$selected_models <- new_best_model$cand_final
 #' calib_results_glm$summary <- new_best_model$summary
 #'
-sel_best_models3 <- function(data,
-                            calibration_results = NULL,
-                            cand_models = NULL,
-                            model_type = c("glmnet", "glm"),
-                            test_concave = TRUE,
-                            omrat_threshold = 10,
-                            allow_tolerance = TRUE,
-                            tolerance = 0.01,
-                            AIC = "ws",
-                            significance = 0.05,
-                            delta_aic = 2,
-                            addsamplestobackground = TRUE,
-                            weights = NULL,
-                            verbose = TRUE) {
+sel_best_models3 <- function(calibration_results = NULL,
+                             cand_models = NULL,
+                             data = NULL,
+                             calc_proc = FALSE,
+                             addsamplestobackground = TRUE,
+                             weights = NULL,
+                             model_type = c("glmnet", "glm"),
+                             test_concave = TRUE,
+                             omrat_threshold = 10,
+                             allow_tolerance = TRUE,
+                             tolerance = 0.01,
+                             AIC_option = "ws",
+                             significance = 0.05,
+                             delta_aic = 2,
+                             parallel = FALSE,
+                             ncores = 1,
+                             parallel_type = "doSNOW",
+                             progress_bar = FALSE,
+                             verbose = TRUE) {
   #Check data
-  if(is.null(calibration_results) & is.null(cand_models)){
+  if (is.null(calibration_results) & is.null(cand_models)) {
     stop("You must specified calibration_results or cand_models")
   }
 
-  if(!is.null(calibration_results)){
+  if (is.null(calibration_results) & is.null(data) & calc_proc) {
+    stop("When you set 'calc_proc = TRUE', you must provide calibration_results or data")
+  }
+
+  if (!is.null(calibration_results)) {
     cand_models <- calibration_results$calibration_results$Summary
+  }
+
+  #Update weights and addsamplestobackground from calibration_results, if necessary
+  if(!is.null(calibration_results)){
+    weights <- calibration_results$weights
+    addsamplestobackground <- calibration_results$addsamplestobackground
   }
 
   # Adjust AIC column based on model type
   if (model_type == "glmnet") {
     # Remove the unused AIC column in glmnet
-    if (AIC == "nk") {
-      AIC <- "AIC_nk"
+    if (AIC_option == "nk") {
+      AIC_option <- "AIC_nk"
       cand_models$AIC_ws <- NULL
-    } else if (AIC == "ws") {
-      AIC <- "AIC_ws"
+    } else if (AIC_option == "ws") {
+      AIC_option <- "AIC_ws"
       cand_models$AIC_nk <- NULL
     } else {
-      stop("Unsupported AIC type. Please use 'nk' or 'ws'.")
+      stop("Unsupported AIC option. Please use 'nk' or 'ws'.")
     }
   } else if (model_type == "glm") {
-    AIC <- "AIC" # For glm models, we only use a single AIC column
+    AIC_option <- "AIC" # For glm models, we only use a single AIC column
   } else {
-    stop("Unsupported model type. Please use 'glmnet' or 'glm'.")
+    stop("Unsupported model_type. Please use 'glmnet' or 'glm'.")
   }
 
   # Omission rate column name
   om_thr <- paste0("Omission_rate_at_", omrat_threshold, ".mean")
 
   #proc-pval columns
-  #proc_pval <- paste0("pval_pROC_at_", omrat_threshold, ".mean")
+  proc_pval <- paste0("pval_pROC_at_", omrat_threshold, ".mean")
 
-  any_bad <- TRUE #To initiate looping
-  id_to_remove <- 0
 
-  while(any_bad){
-    #Remove bad models
-  cand_models <- cand_models[!(cand_models$ID %in% id_to_remove),]
-
+  #Check if it's necessary calculate proc
+  if(all(is.na(cand_models[[proc_pval]]))){
+    if(!calc_proc){
+      stop("Calibration results do not contain PROC values. Set 'calc_proc' to TRUE.")
+    }
+  }
 
   # Log the number of models being filtered
   if (verbose) {
-    message("\nFiltering ", nrow(cand_models), " models")
+    message("Selecting best among ", nrow(cand_models), " models")
   }
 
-  # Remove models with errors
-  na_models <- cand_models[is.na(cand_models$is_concave), "ID"]
-  if (verbose) {
-    message("Removing ", length(na_models), " model(s) because they failed to fit")
-  }
-  cand_models <- cand_models[!is.na(cand_models$is_concave), ]
 
-  # Remove concave curves if test_concave is TRUE
-  if (test_concave) {
-    concave_models <- cand_models[cand_models$is_concave, "ID"]
-    if (verbose) {
-      message("Removing ", length(concave_models), " model(s) with concave curves")
+  #### Initiate filtering if it's necessary to calculate proc ####
+  if(calc_proc){
+
+    if(verbose){
+      message("Calculating pROC...")
     }
-    cand_models <- cand_models[!cand_models$is_concave, ]
-  } else {
-    concave_models <- 0
-  }
 
-  # Subset models by omission rate
-  high_omr <- cand_models[cand_models[, om_thr] > omrat_threshold / 100, "ID"]
-  cand_om <- cand_models[cand_models[, om_thr] <= omrat_threshold / 100, ]
-  if (verbose) {
-    message(nrow(cand_om), " models were selected with omission rate below ", omrat_threshold, "%")
-  }
+    any_bad <- TRUE #To initiate looping
+    id_to_remove <- 0
 
-  # Stop if no models meet the omission rate threshold and allow_tolerance is FALSE
-  if (nrow(cand_om) == 0 & !allow_tolerance) {
-    stop("There are no models with values of omission rate below ", omrat_threshold, "%. Try with allow_tolerance = TRUE.")
-  }
+    while(any_bad){
+      #Remove bad models
+      cand_models <- cand_models[!(cand_models$ID %in% id_to_remove),]
 
-  # Apply tolerance if no models meet the omission rate threshold and allow_tolerance is TRUE
-  if (nrow(cand_om) == 0 & allow_tolerance) {
-    min_thr <- min(cand_models[, om_thr])
-    cand_om <- subset(cand_models, cand_models[, om_thr] <= min_thr + tolerance)
-    high_omr <- cand_models[cand_models[, om_thr] > min_thr + tolerance, "ID"]
+
+      # Log the number of models being filtered
+      if (verbose) {
+        message("\nFiltering ", nrow(cand_models), " models")
+      }
+
+      # Remove models with errors
+      na_models <- cand_models[is.na(cand_models$is_concave), "ID"]
+      if (verbose) {
+        message("Removing ", length(na_models), " model(s) because they failed to fit")
+      }
+      cand_models <- cand_models[!is.na(cand_models$is_concave), ]
+
+      # Remove concave curves if test_concave is TRUE
+      if (test_concave) {
+        concave_models <- cand_models[cand_models$is_concave, "ID"]
+        if (verbose) {
+          message("Removing ", length(concave_models), " model(s) with concave curves")
+        }
+        cand_models <- cand_models[!cand_models$is_concave, ]
+      } else {
+        concave_models <- 0
+      }
+
+      # Subset models by omission rate
+      high_omr <- cand_models[cand_models[, om_thr] > omrat_threshold / 100, "ID"]
+      cand_om <- cand_models[cand_models[, om_thr] <= omrat_threshold / 100, ]
+      if (verbose) {
+        message(nrow(cand_om), " models were selected with omission rate below ", omrat_threshold, "%")
+      }
+
+      # Stop if no models meet the omission rate threshold and allow_tolerance is FALSE
+      if (nrow(cand_om) == 0 & !allow_tolerance) {
+        stop("There are no models with values of omission rate below ", omrat_threshold, "%. Try with allow_tolerance = TRUE.")
+      }
+
+      # Apply tolerance if no models meet the omission rate threshold and allow_tolerance is TRUE
+      if (nrow(cand_om) == 0 & allow_tolerance) {
+        min_thr <- min(cand_models[, om_thr])
+        cand_om <- subset(cand_models, cand_models[, om_thr] <= min_thr + tolerance)
+        high_omr <- cand_models[cand_models[, om_thr] > min_thr + tolerance, "ID"]
+        if (verbose) {
+          message("Minimum value of omission rate (", round(min_thr * 100, 1), "%) is above the selected threshold (", omrat_threshold, "%).\nApplying tolerance and selecting ", nrow(cand_om), " models with omission rate <", round(min_thr * 100 + tolerance, 1), "%")
+        }
+      }
+
+      # Calculate delta AIC and select models based on delta AIC
+      cand_om$dAIC <- cand_om[, AIC_option] - min(cand_om[, AIC_option])
+      high_aic <- cand_om[cand_om$dAIC > delta_aic, "ID"]
+      cand_final <- cand_om[cand_om$dAIC <= delta_aic, ]
+
+      if (verbose) {
+        message("Selecting ", nrow(cand_final), " final model(s) with delta AIC <", delta_aic)
+      }
+
+      # Validate pROC
+      if (verbose) {
+        message("Validating pROC of selected models...")
+      }
+
+      if(is.null(data)){
+        data <- calibration_results
+      }
+
+      proc_values <- partial_roc(formula_grid = cand_final, data = data,
+                                 omission_rate = omrat_threshold,
+                                 addsamplestobackground, weights,
+                                 model_type, parallel, ncores,
+                                 parallel_type, progress_bar)
+      # Create a copy of cand_final to keep the original data unchanged
+      cand_final_updated <- cand_final
+
+      # Identify matching rows in cand_final
+      match_idx <- match(cand_final_updated$ID, proc_values$ID)
+
+      # Replace NA values in cand_final_updated with corresponding values from proc_values
+      for (col in names(proc_values)[-ncol(proc_values)]) {  # Ignoring the ID column
+        na_idx <- is.na(cand_final_updated[[col]])  # Identifying NAs in cand_final_updated column
+        cand_final_updated[[col]][na_idx] <- proc_values[[col]][match_idx][na_idx]
+      }
+
+      # Check if p_value is non-significative
+      p_value_omr <- cand_final_updated[,paste0("pval_pROC_at_",
+                                                omrat_threshold, ".mean")]
+      any_bad <- any(p_value_omr > significance | is.na(p_value_omr))
+      #Get models to remove, if necessary
+      id_to_remove <- cand_final_updated$ID[p_value_omr > significance |
+                                              is.na(p_value_omr)]
+
+      if(any_bad & verbose){
+        message("\nModels with non-significant pROC values were identified. Re-selecting models...")
+      } else {
+        cand_final <- cand_final_updated
+        insig_proc <- NULL}
+
+    } #End of anybad
+  } #End of calculate proc
+
+  if(!calc_proc){
+    #### Initiate filtering if it's NOT necessary to calculate proc ####
+    # Remove models with errors
+    na_models <- cand_models[is.na(cand_models$is_concave), "ID"]
     if (verbose) {
-      message("Minimum value of omission rate (", round(min_thr * 100, 1), "%) is above the selected threshold (", omrat_threshold, "%).\nApplying tolerance and selecting ", nrow(cand_om), " models with omission rate <", round(min_thr * 100 + tolerance, 1), "%")
+      message("\nRemoving ", length(na_models), " model(s) that failed to fit")
     }
-  }
+    cand_models <- cand_models[!is.na(cand_models$is_concave), ]
 
-  # Calculate delta AIC and select models based on delta AIC
-  cand_om$dAIC <- cand_om[, AIC] - min(cand_om[, AIC])
-  high_aic <- cand_om[cand_om$dAIC > delta_aic, "ID"]
-  cand_final <- cand_om[cand_om$dAIC <= delta_aic, ]
+    # Remove concave curves if test_concave is TRUE
+    if (test_concave) {
+      concave_models <- cand_models[cand_models$is_concave, "ID"]
+      if (verbose) {
+        message("Removing ", length(concave_models), " model(s) with concave responses")
+      }
+      cand_models <- cand_models[!cand_models$is_concave, ]
+    } else {
+      concave_models <- 0
+    }
 
-  if (verbose) {
-    message("Selecting ", nrow(cand_final), " final model(s) with delta AIC <", delta_aic)
-  }
+    # Subset models with significant pROC
+    insig_proc <- cand_models[cand_models[[proc_pval]] >= significance |
+                                is.na(cand_models[[proc_pval]]), "ID"]
+    if (verbose) {
+      message("Removing ", length(insig_proc), " model(s) with non-significant pROC values")
+    }
+    cand_models <- cand_models[cand_models[[proc_pval]] < significance &
+                                 !is.na(cand_models[[proc_pval]]), ]
 
-  # Validate pROC
-  if (verbose) {
-    message("Validating pROC...")
-  }
-  proc_values <- validate_proc(cand_final, data, omrat_threshold,
-                               addsamplestobackground, weights,
-                               model_type)
+    # Subset models by omission rate
+    high_omr <- cand_models[cand_models[, om_thr] > omrat_threshold / 100, "ID"]
+    cand_om <- cand_models[cand_models[, om_thr] <= omrat_threshold / 100, ]
+    if (verbose) {
+      message(nrow(cand_om), " models passed the ", omrat_threshold, "% omission criterion")
+    }
 
-  # Create a copy of cand_final to keep the original data unchanged
-  cand_final_updated <- cand_final
+    # Stop if no models meet the omission rate threshold and allow_tolerance is FALSE
+    if (nrow(cand_om) == 0 & !allow_tolerance) {
+      stop("There were no models with omissions below ", omrat_threshold, "%.",
+           "Try using the arguments 'allow_tolerance' and 'tolerance'.")
+    }
 
-  # Identify matching rows in cand_final
-  match_idx <- match(cand_final_updated$ID, proc_values$ID)
+    # Apply tolerance if no models meet the omission rate threshold and allow_tolerance is TRUE
+    if (nrow(cand_om) == 0 & allow_tolerance) {
+      min_thr <- min(cand_models[, om_thr])
+      cand_om <- subset(cand_models, cand_models[, om_thr] <= min_thr + tolerance)
+      high_omr <- cand_models[cand_models[, om_thr] > min_thr + tolerance, "ID"]
+      if (verbose) {
+        message("Minimum value of omission in models (", round(min_thr * 100, 1),
+                "%) > omission criterion (", omrat_threshold, "%).\n",
+                "Applying tolerance: ", nrow(cand_om), " models with omission <",
+                round((min_thr + tolerance) * 100, 1), "% were found")
+      }
+    }
 
-  # Replace NA values in cand_final_updated with corresponding values from proc_values
-  for (col in names(proc_values)[-ncol(proc_values)]) {  # Ignoring the ID column
-    na_idx <- is.na(cand_final_updated[[col]])  # Identifying NAs in cand_final_updated column
-    cand_final_updated[[col]][na_idx] <- proc_values[[col]][match_idx][na_idx]
-  }
+    # Calculate delta AIC and select models based on delta AIC
+    cand_om$dAIC <- cand_om[, AIC_option] - min(cand_om[, AIC_option])
+    high_aic <- cand_om[cand_om$dAIC > delta_aic, "ID"]
+    cand_final <- cand_om[cand_om$dAIC <= delta_aic, ]
 
-  # Check if p_value is non-significative
-  p_value_omr <- cand_final_updated[,paste0("pval_pROC_at_",
-                                            omrat_threshold, ".mean")]
-  any_bad <- any(p_value_omr > significance)
-  #Get models to remove, if necessary
-  id_to_remove <- cand_final_updated$ID[p_value_omr > significance]
-
-  if(any_bad & verbose){
-    message("Models with non-significant pROC values were identified. Re-selecting models...")
-  }
-
+    if (verbose) {
+      message("Selecting ", nrow(cand_final), " final model(s) with delta AIC <", delta_aic)
+    }
   }
 
   # Final results
-  sel_res <- list(cand_final = cand_final_updated,
+  sel_res <- list(cand_final = cand_final,
                   summary = list("delta_AIC" = delta_aic,
                                  "omission_rate_thr" = omrat_threshold,
                                  "Errors" = na_models,
                                  "Concave" = concave_models,
+                                 "Non_sig_pROC" = insig_proc,
                                  "High_omission_rate" = high_omr,
                                  "High_AIC" = high_aic,
-                                 "Selected" = cand_final_updated$ID))
+                                 "Selected" = cand_final$ID))
 
   #Update calibration_results if necessary
-  if(!is.null(calibration_results)){
+  if(!is.null(calibration_results)) {
     calibration_results$selected_models <- sel_res$cand_final
     calibration_results$summary <- sel_res$summary
     calibration_results$omission_rate <- omrat_threshold
     return(calibration_results)
   } else {
     return(sel_res)}
-}
-
-
-validate_proc <- function(cand_final, data, omission_rate,
-                          addsamplestobackground, weights,
-                          model_type) {
-  #Validate pROC
-  res_proc <- lapply(1:nrow(cand_final), function(x){
-    grid_x <- cand_final[x,] # Get i candidate model
-    #Get formula and reg
-    formula_x <- as.formula(grid_x$Formulas)
-    reg_x <- grid_x$regm
-
-    # Get background index
-    bgind <- which(data$calibration_data$pr_bg == 0)
-
-    # Fit models using k-fold cross-validation
-    mods <- try(lapply(1:length(data$kfolds), function(i) {
-      notrain <- -data$kfolds[[i]]
-      data_i <- data$calibration_data[notrain,]
-
-      # Set weights per k-fold
-      if (!is.null(weights)){
-        weights_i <- weights[notrain]
-      } else {
-        weights_i <- NULL
-      }
-
-      if (model_type == "glmnet") {
-        # Run glmnet model
-        mod_i <- glmnet_mx(p = data_i$pr_bg, data = data_i,
-                           f = formula_x, regmult = reg_x,
-                           addsamplestobackground = addsamplestobackground,
-                           weights = weights_i, calculate_AIC = FALSE)
-      } else {
-        # Run glm model
-        mod_i <- glm_mx(formula = formula_x,
-                        family = binomial(link = "cloglog"),
-                        data = data_i, weights = weights_i)
-      }
-
-      # Predict model
-      pred_i <- if (model_type == "glmnet") {
-        as.numeric(predict.glmnet_mx(object = mod_i,
-                                     newdata = data$calibration_data,
-                                     clamp = FALSE, type = "cloglog"))
-      } else if (model_type == "glm") {
-        enmpa::predict_glm(model = mod_i,
-                           newdata = data$calibration_data,
-                           type = "response")
-      }
-
-      # Extract suitability in train and test points
-      suit_val_cal <- pred_i[unique(c(notrain, -bgind))]
-      suit_val_eval <- pred_i[which(!-notrain %in% bgind)]
-
-      #Proc
-      proc_i <- lapply(omission_rate, function(omr){
-        proc_omr <- enmpa::proc_enm(test_prediction = suit_val_eval,
-                                    prediction = pred_i,
-                                    threshold = omr)$pROC_summary
-        names(proc_omr) <- c(paste0("Mean_AUC_ratio_at_", omr),
-                             paste0("pval_pROC_at_", omr))
-        return(proc_omr)
-      })
-      proc_i <- unlist(proc_i)
-
-      # Save metrics in a dataframe
-      df_proc <-  if (model_type == "glmnet") {
-        data.frame(Replicate = i,
-                   t(proc_i),
-                   row.names = NULL)
-      } else if (model_type == "glm") {
-        data.frame(Replicate = i,
-                   t(proc_i),
-                   row.names = NULL)
-      }
-      return(df_proc)
-    }), silent = TRUE)
-    #Get summary
-    proc_df <- do.call("rbind", mods)
-
-    #Get means and sd
-    means <- sapply(proc_df[, -1], mean)  # Excluindo a coluna Replicate
-    sds <- sapply(proc_df[, -1], sd)
-
-    #Create new dataframe
-    proc_df <- data.frame(
-      t(c(means, sds))
-    )
-    #Rename
-    names(proc_df) <- c(paste0(names(means), ".mean"), paste0(names(sds), ".sd"))
-
-    #Append model ID
-    proc_df$ID <- grid_x$ID
-
-    return(proc_df)
-  })
-
-  #Bind results
-  return(do.call("rbind", res_proc))
 }
